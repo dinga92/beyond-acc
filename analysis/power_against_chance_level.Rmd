@@ -1,0 +1,684 @@
+---
+title: "Power against chance level"
+output: 
+  rmarkdown::html_vignette:
+    toc: True
+    toc_depth: 3
+vignette: >
+  %\VignetteIndexEntry{power_against_chance_level}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## Introduction
+
+This document examines the statistical properties (type I and type II error rates) of various performance measures. I.e., compare what the sensitivity to find a statistically significant effect when the effect truly exists (statistical power, type II error) is and what is the probability of finding statistically significant result when there is no true effect in the data (type I error)
+
+This document uses helper functions that are in `../helpers` datasets that are in `../data` and datasets that are part of mlbench library. 
+
+## Set up helper functions
+
+Our primary tool for the analysis is `calculate_proportion_signifficant` function. This function takes as arguments a generator function, list of parameters, number of simulations to be performed, and number of cores to be used for multicore processing.
+
+The generator function is a function that is run with one argument from the list of parameters and returns a vector of p-values. This will allow us to run a wide range of simulations without the need to rewrite the code. How it is used will become clearer in the next section.
+
+```{r setup}
+library(psych)
+library(parallel)
+library(reshape2)
+source('../helpers/data_loading.R')
+source('../helpers/significance_functions.R')
+source('../helpers/utility_functions.R')
+source('../helpers/scoring_functions.R')
+
+run_power_analysis_on_generator <- function(pval_generator,
+                                              parameters,
+                                              n_sims, 
+                                              ncores=1){
+  # intialize cluster for parallel processing, type='FORK' for workers
+  # to be able to use defined functions, i.e. the generator
+  cl = makeCluster(ncores, type = 'FORK')
+  clusterSetRNGStream(cl) # so that random numebrs don't synchronize 
+  on.exit(stopCluster(cl))
+  # for each parameter form the list of parameters, we run generator function
+  # that produce p-values n_sims number of times
+  results <- list()
+  for(parameter in parameters){
+    # this does the same as the line bellow, only in parallel
+    # pvals <- t(replicate(n_sims, generator(param)))
+    pvals <- t(parSapply(cl, 1:n_sims, function(x){pval_generator(parameter)}))
+    # calculate proportions of p values < 0.05
+    results <- append(results, list(colMeans(pvals < 0.05)))
+  }
+  results <- as.data.frame(do.call(rbind, results))
+  results$parameter <- parameters
+  return(results)
+}
+```
+
+Next, `get_all_pvals` is a convenience function to compute multiple p-values. This function calls `p_val_acc`, `p_val_auc`, `p_val_brier`, and `p_val_logscore` functions to obtain p-values from all these tests. It takes the following parameters as input. If we would be interested in the performance of different tests or performance measures, this is the function to edit. The actual functions that compute p values are in the `../helpers/significance_functions.R`
+
+**predictions** probabilistic predictions (scaled 0 to 1)
+
+**labels** observed values (coded as 0 or 1)
+
+**acc_threshold** value used to threshold probabilistic predictions into categorical predictions to compute the accuracy
+
+**nperms** maximum number of permutations performed for permutation test used to obtain p-values for brier and logarithmic scores
+
+**permtest_method** early stop or fixedn, if early stopping method is used for permutation test or all permutations are always performed
+
+**permtest_earlystop_threshold** what p.value use considered for earlystop method
+
+and it returns a vector of p-values for all performed tests
+
+```{r, cache=TRUE}
+get_all_pvals <- function(predictions, labels, acc_threshold=0.5, nperms=5000,
+                          permtest_method='earlystop',
+                          permtest_earlystop_threshold=0.05){
+  # thresholding to get 0/1 predictions for acc
+  p_acc <-  p_val_acc(predictions > acc_threshold, labels)
+  p_auc <-  p_val_auc(predictions, labels)
+  p_brier <-  p_val_brier(predictions, labels,
+                          method=permtest_method,
+                          nperms=nperms,
+                          earlystop_threshold=permtest_earlystop_threshold)
+  p_logscore <- p_val_logscore(predictions,
+                               labels,
+                               method=permtest_method,
+                               nperms=nperms,
+                               earlystop_threshold=permtest_earlystop_threshold)
+  c("Accuracy"=p_acc, "AUC"=p_auc, "Brier"=p_brier, "Logarithmic"=p_logscore)
+}
+```
+
+And last, a convenience function for plotting of results.
+
+```{r, cache=TRUE}
+library(ggplot2)
+library(cowplot)
+
+plot_results_bars <- function(alphas, id_name='parameter'){
+  colors <- c("black", "#375e97", "#fb6542", '#ffbb00')
+  # results_comp_n$parameter <- as.factor(results_comp_n$parameter)
+  alphas[,id_name] <- as.factor(alphas[,id_name])
+  melted_alphas <- melt(alphas, id.vars = id_name)
+  names(melted_alphas)[1] <- 'parameter'
+  
+  ggplot(melted_alphas) +
+    geom_bar(aes(x=parameter, fill=variable, y=value),
+                 stat='identity', position=position_dodge()) +
+    # scale_fill_OkabeIto(order=c(8,6,2,4), use_black=T) +
+    scale_fill_manual(values=colors) +
+    theme_minimal_hgrid() +
+    xlab('n') +
+    ylab('Proportion p < 0.05') +
+    scale_y_continuous(limits=c(0,1), breaks=seq(0, 1, 0.2)) +
+    theme(legend.title = element_blank())
+}
+```
+
+## Compare power
+
+Here we compare the statistical power of NHST tests using specific performance measures as a test statistic. 
+
+### Simulated predictions
+
+First, we simulate model predictions directly (instead of simulating data to which a ML model is fitted). We consider a simple situation of samples from two Gaussian distributions and estimate statistical power. 
+
+
+First, we create a function that randomly draws samples from two Gaussian distributions and transforms the values to 0-1 range using a logistic function, thus simulating probabilistic predictions for two classes. Then we calculate p values of a hypothesis that the performance of these predictions is at the chance level. 
+
+This function takes arguments  
+**n** sample size
+**diff** difference (in standard deviations) betweet the two distributions
+**sd** standard deviation of distributions
+
+```{r, cache=TRUE}
+library(psych)
+
+generate_simulated_predictions <- function(n, diff, sd) {
+  x <- c(logistic(rnorm(n/2, mean = -diff/2*sd, sd=sd)),
+         logistic(rnorm(n/2, mean = diff/2*sd, sd=sd)))
+  y <- c(rep(0, n/2), rep(1, n/2))
+  get_all_pvals(x, y)
+}
+```
+
+Next, we wrap the `gen_sd_diff` to create a generator that takes only the number of subjects as an argument to be used in the `calculate_proportion_signifficant` function. 
+
+```{r, cache=TRUE}
+gen_pval_n <- function(n){
+    generate_simulated_predictions(n, 
+                                   diff = 0.5, 
+                                   sd = 1)
+}
+```
+
+Here we run the simulation. I.e. the *generator* function is called *n_sims* for each element of *n_vec*. Thus we calculate the proportion of statistically significant results, with respect to a number of subjects in a dataset and specific performance measure.
+
+```{r, cache=TRUE}
+n_vec <- seq(20, by = 60, length.out = 4)
+n_sims = 1000
+
+results_simulated_predictions <- run_power_analysis_on_generator(
+                                       pval_generator = gen_pval_n,
+                                       parameters = n_vec,
+                                       n_sims = n_sims,
+                                       ncores = 4)
+
+p_simulated_predictions <- plot_results_bars(results_simulated_predictions)
+p_simulated_predictions
+```
+
+In order to be sure that the differences are due to differences in sensitivity of tests and not because some tests are overly optimistic, we rerun the analysis with the data simulated so that the true difference between the classes is 0. This is achieved by changing the `gen_p_val_n` function. Otherwise, everything stays the same.  
+
+```{r, cache=TRUE}
+gen_pval_n_null <- function(n){
+    generate_simulated_predictions(n, 
+                                   diff = 0, # true difference is 0 
+                                   sd = 1)
+}
+
+results_simulated_null <- run_power_analysis_on_generator(
+                             pval_generator = gen_pval_n_null, # changed this
+                             parameters = n_vec,
+                             n_sims = n_sims*10,
+                             ncores = 4)
+
+p_simulated_predictions_null <- plot_results_bars(results_simulated_null) + ylim(c(0,0.1))
+p_simulated_predictions_null 
+```
+
+### Simulated data - machine learning prediction
+
+In this section, the statistical power of a machine learning model fitted to the simulated data is examined. 
+
+We will use alphas from before. Here, we create the generator function, that when called, performs dataset generation, machine learning training, and prediction and returns the set of p-values. It allows for specifying argument `shuffle.y` to shuffle target values to simulate null distribution.
+
+
+First, we create a function that generates **n** datapoints from two groups.
+
+```{r, cache=TRUE}
+library(MASS)
+mixed_gaussians_data_generator <- function(n, shuffle.y=F){
+  sigma <- diag(6)
+  x1 <- mvrnorm(n=n, mu=c(0,0,0,0,0,0), Sigma=sigma)
+  x2 <- mvrnorm(n=n, mu=c(0,0,0,1,1,1)*0.3, sigma)
+  x <- rbind(x1, x2)
+  y <- c(rep(0, nrow(x1)), rep(1, nrow(x2)))
+  if (shuffle.y) {
+    y <- sample(y)
+  }
+  df <- as.data.frame(cbind(y, x))
+}
+```
+
+Next, we create a function that given a data generator and a number of samples to generate.
+
+- uses this data generator to create a dataset  
+- split the created dataset into training and test set  
+- fit an SVM model on the training set  
+- makes probabilistic predictions on the test set  
+- and calculates p-values of these probabilistic predictions
+
+```{r, cache=TRUE}
+library(kernlab)
+library(caret)
+
+gen_pval_svm <- function(data_generator, n){
+  data <- data_generator(n*2)
+  data <- as.data.frame(data)
+  train_idx <- createDataPartition(data$y, list=F)
+  train_data <- data[train_idx,]
+  test_data <- data[-train_idx,]
+  
+  fit <- ksvm(y ~ ., data=train_data,
+              prob.model=T, 
+              type='C-svc', 
+              kernel='rbfdot',
+              C=1,
+              sigma=1)
+  predictions <- as.data.frame(predict(fit, 
+                                             newdata=test_data, 
+                                             type='probabilities'))$`1`
+  p.vals <- get_all_pvals(predictions, test_data$y)
+}
+```
+
+now we wrap these functions into the genrator function and perform simulations for various sample sizes
+
+```{r, cache=TRUE}
+gen_pval_svm_sim <- function(n){
+  gen_pval_svm(mixed_gaussians_data_generator, n)
+}
+
+n_vec <- seq(40, by=40, length.out = 4)
+results_svm_sim <- run_power_analysis_on_generator(
+                                 pval_generator = gen_pval_svm_sim,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+
+p_svm_sim <- plot_results_bars(results_svm_sim)
+p_svm_sim
+```
+
+Repeat the same analysis, but when there is no true difference between the distributions using the `shuffle.y = TRUE` argument.
+
+```{r, cache=TRUE}
+mixed_gaussians_data_generator_shuffled <- function(n){
+  mixed_gaussians_data_generator(n, shuffle.y = TRUE)
+}
+
+gen_pval_svm_sim_null <- function(n){
+  gen_pval_svm(mixed_gaussians_data_generator_shuffled, n)
+}
+
+results_svm_sim_null <- run_power_analysis_on_generator(
+                                 pval_generator = gen_pval_svm_sim_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+
+p_svm_sim_null <- plot_results_bars(results_svm_sim_null)
+p_svm_sim_null + ylim(c(0,0.1))
+```
+
+### Real data - OASIS prediction
+
+Comparison using the real data is performed using the same `gen_pval_svm` function that was used on the simulated data. We need to create a generator function that returns data from the real dataset. 
+
+This generator takes the number of subjects *n* as an input and returns a random sample of size *n* with the same number of subjects for each target group (male or female). We also prepare a generator function to create the null data i.e., data with shuffled target values. 
+
+```{r, cache=TRUE}
+run_svm_power_analysis_on_dataset <- function(dataset,
+                                          parameters,
+                                          n_sims,
+                                          ncores=1,
+                                          shuffle.y=FALSE){
+  
+  balanced_data_generator <- function(n){
+    idx0 <- which(dataset$y %in% 0, arr.ind = T)
+    idx1 <- which(dataset$y %in% 1, arr.ind = T)
+    selected <- c(sample(idx0, n/2), sample(idx1, n/2))
+    return_data <- dataset[selected,]
+    if (shuffle.y){
+      return_data$y <- sample(return_data$y)
+    }
+    return(return_data)
+  }
+  
+  pval_generator <- function(n){
+    gen_pval_svm(balanced_data_generator, n)
+  }
+  
+  results <- run_power_analysis_on_generator(pval_generator = pval_generator,
+                                             parameters = parameters,
+                                             n_sims = n_sims,
+                                             ncores = ncores)
+  return(results)
+}
+```
+
+#### Oasis gm gender 
+
+Run the analysis 
+
+```{r, cache=TRUE}
+oasis_gm_data_gender <- load_oasis(y='gender', modality='gm')
+n_vec <- seq(20, by=15, length.out = 4)
+
+oasis_gm_results_gender <- run_svm_power_analysis_on_dataset(
+                                                   oasis_gm_data_gender,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims,
+                                                   ncores = 4)
+
+p_oasis_gm_gender <- plot_results_bars(oasis_gm_results_gender)
+p_oasis_gm_gender
+```
+
+#### oasis wm gender
+
+```{r, cache=TRUE}
+oasis_wm_data_gender <- load_oasis(y='gender', modality='wm')
+n_vec <- seq(20, by=15, length.out = 4)
+
+oasis_wm_results_gender <- run_svm_power_analysis_on_dataset(
+                                                   oasis_wm_data_gender,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims,
+                                                   ncores = 4)
+
+p_oasis_wm_gender <- plot_results_bars(oasis_wm_results_gender)
+p_oasis_wm_gender
+```
+
+#### oasis gm diagnosis
+
+```{r, cache=TRUE}
+oasis_gm_data_diagnosis <- load_oasis(y='diagnosis', modality='gm')
+n_vec <- seq(20, by=15, length.out = 4)
+
+oasis_gm_results_diagnosis <- run_svm_power_analysis_on_dataset(
+                                                   oasis_gm_data_diagnosis,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims,
+                                                   ncores = 4)
+
+p_oasis_gm_diagnosis <- plot_results_bars(oasis_gm_results_diagnosis)
+p_oasis_gm_diagnosis
+```
+
+#### oasis wm diagnosis
+
+```{r, cache=TRUE}
+oasis_wm_data_diagnosis <- load_oasis(y='diagnosis', modality='wm')
+n_vec <- seq(25, by=15, length.out = 4)
+
+oasis_wm_results_diagnosis <- run_svm_power_analysis_on_dataset(
+                                                   oasis_wm_data_diagnosis,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims,
+                                                   ncores = 4)
+
+p_oasis_wm_diagnosis <- plot_results_bars(oasis_wm_results_diagnosis)
+p_oasis_wm_diagnosis
+```
+
+run the analysis on the null data 
+
+```{r, cache=TRUE}
+results_svm_oasis_null_gm_gender <- run_svm_power_analysis_on_dataset(
+                                                   oasis_gm_data_gender,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims*10,
+                                                   ncores = 4,
+                                                   shuffle.y = T)
+results_svm_oasis_null_wm_gender <- run_svm_power_analysis_on_dataset(
+                                                   oasis_wm_data_gender,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims*10,
+                                                   ncores = 4,
+                                                   shuffle.y = T)
+results_svm_oasis_null_gm_diagnosis <- run_svm_power_analysis_on_dataset(
+                                                   oasis_gm_data_diagnosis,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims*10,
+                                                   ncores = 4,
+                                                   shuffle.y = T)
+results_svm_oasis_null_wm_diagnosis <- run_svm_power_analysis_on_dataset(
+                                                   oasis_wm_data_diagnosis,
+                                                   parameters = n_vec,
+                                                   n_sims = n_sims*10,
+                                                   ncores = 4,
+                                                   shuffle.y = T)
+
+p_oasis_null_gm_gender <- plot_results_bars(results_svm_oasis_null_gm_gender) + ylim(c(0,0.1))
+p_oasis_null_wm_gender <- plot_results_bars(results_svm_oasis_null_wm_gender) + ylim(c(0,0.1))
+p_oasis_null_gm_diagnosis <- plot_results_bars(results_svm_oasis_null_gm_diagnosis) + ylim(c(0,0.1))
+p_oasis_null_wm_diagnosis <- plot_results_bars(results_svm_oasis_null_wm_diagnosis) + ylim(c(0,0.1))
+
+p_oasis_null_gm_gender 
+p_oasis_null_wm_gender 
+p_oasis_null_gm_diagnosis 
+p_oasis_null_wm_diagnosis 
+```
+
+### Real data - ABIDE male/female prediction
+
+Run the analysis on ABIDE dataset
+
+```{r, cache=TRUE}
+abide_data <- load_abide()
+
+n_vec <- seq(20, by = 40, length.out = 4)
+results_svm_abide <- run_svm_power_analysis_on_dataset(abide_data,
+                                                       parameters = n_vec,
+                                                       n_sims = n_sims,
+                                                       ncores = 4)
+
+p_abide <- plot_results_bars(results_svm_abide)
+p_abide
+```
+
+And run the analysis on null data
+
+```{r, cache=TRUE}
+results_svm_abide_null <- run_svm_power_analysis_on_dataset(abide_data,
+                                                       parameters = n_vec,
+                                                       n_sims = n_sims*10,
+                                                       ncores = 4,
+                                                       shuffle.y = T)
+
+p_abide_null <- plot_results_bars(results_svm_abide_null) + ylim(c(0,0.1))
+p_abide_null 
+```
+
+## non imaging datasets
+
+Here we run the same analysis on several non-neuroimaging datasets
+
+```{r, cache=TRUE}
+library(mlbench)
+
+data("PimaIndiansDiabetes")
+names(PimaIndiansDiabetes)[9] <- 'y'
+PimaIndiansDiabetes$y <- as.numeric(PimaIndiansDiabetes$y) - 1
+
+results_pima <- run_svm_power_analysis_on_dataset(PimaIndiansDiabetes,
+                                 parameters = seq(10, by = 10, length.out = 4),
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_pima_null <- run_svm_power_analysis_on_dataset(PimaIndiansDiabetes,
+                                 parameters = seq(10, by = 10, length.out = 4),
+                                 n_sims = n_sims*10,
+                                 ncores = 4,
+                                 shuffle.y = T)
+
+p_pima <- plot_results_bars(results_pima)
+p_pima_null <- plot_results_bars(results_pima_null) + ylim(c(0,0.1))
+
+p_pima
+p_pima_null 
+```
+
+
+```{r, cache=TRUE}
+data("Sonar")
+Sonar$Class <- as.numeric(Sonar$Class) -1
+names(Sonar)[61] <- 'y'
+
+results_sonar <- run_svm_power_analysis_on_dataset(
+                                 Sonar,
+                                 parameters = seq(10, by = 10, length.out = 4),
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_sonar_null <- run_svm_power_analysis_on_dataset(
+                                 Sonar,
+                                 parameters = seq(10, by = 10, length.out = 4),
+                                 n_sims = n_sims*10,
+                                 ncores = 4,
+                                 shuffle.y = T)
+
+p_sonar <- plot_results_bars(results_sonar)
+p_sonar_null <- plot_results_bars(results_sonar_null) + ylim(c(0,0.1))
+
+p_sonar
+p_sonar_null 
+```
+
+
+```{r, cache=TRUE}
+data("musk")
+musk$Class <- as.numeric(musk$Class) - 1
+names(musk)[167] <- 'y'
+
+results_musk <- run_svm_power_analysis_on_dataset(
+                                 musk,
+                                 parameters = seq(10, by = 10, length.out = 4),
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_musk_null <- run_svm_power_analysis_on_dataset(
+                                 musk,
+                                 parameters = seq(10, by = 10, length.out = 4),
+                                 n_sims = n_sims*10,
+                                 ncores = 4,
+                                 shuffle.y = T)
+
+p_musk <- plot_results_bars(results_musk)
+p_musk_null <- plot_results_bars(results_musk_null) +  ylim(c(0,0.1))
+
+p_musk
+p_musk_null 
+```
+
+
+```{r, cache=TRUE}
+data("spam")
+spam$type <- as.numeric(spam$type) - 1
+names(spam)[58] <- 'y'
+
+results_spam <- run_svm_power_analysis_on_dataset(
+                                 spam,
+                                 parameters = seq(10, by = 20, length.out = 4),
+                                 n_sims = n_sims,
+                                 ncores = 4)
+
+results_spam_null <- run_svm_power_analysis_on_dataset(
+                                 spam,
+                                 parameters = seq(10, by = 20, length.out = 4),
+                                 n_sims = n_sims*10,
+                                 ncores = 4,
+                                 shuffle.y = T)
+
+p_spam <- plot_results_bars(results_spam)
+p_spam_null <- plot_results_bars(results_spam_null) + ylim(c(0,0.1))
+
+p_spam
+p_spam_null 
+```
+
+## make figures
+
+put the results together and create composite and "publicaiton ready" figures
+
+```{r, fig.width=7.48, fig.height=6}
+library(ggpubr)
+
+pubtheme <- theme(aspect.ratio = 1,
+                  text=element_text(size=7),
+                  axis.text = element_text(size=7), 
+                  legend.position = 'bottom',
+                  legend.justification = c(0.5, 0.5))
+
+p <- ggarrange(p_simulated_predictions + pubtheme,
+               p_svm_sim + pubtheme,
+               p_oasis_gm_gender + pubtheme, 
+               p_oasis_wm_gender + pubtheme, 
+               p_oasis_gm_diagnosis + pubtheme, 
+               p_oasis_gm_diagnosis + pubtheme, 
+               p_abide + pubtheme,
+               p_pima + pubtheme,
+               p_sonar + pubtheme,
+               p_musk + pubtheme,
+               p_spam + pubtheme,
+               
+               common.legend = T, 
+               legend='bottom',
+               labels = 'AUTO',
+               # ncol = 4,
+               # nrow=2,
+               font.label = list(size=8)) 
+p
+
+# ggsave('power_null_individual.png', plot = p,
+#        width = 190, height = 150, units = 'mm')
+# ggsave('power_null_individual.tiff', plot = p,
+#        width = 6, height = 4.7, units = 'in')
+```
+
+```{r, fig.width=7.48, fig.height=6}
+
+p <- ggarrange(p_simulated_predictions_null + pubtheme,
+               p_svm_sim_null + pubtheme,
+               p_oasis_null_gm_gender + pubtheme, 
+               p_oasis_null_wm_gender + pubtheme, 
+               p_oasis_null_gm_diagnosis + pubtheme, 
+               p_oasis_null_gm_diagnosis + pubtheme, 
+               p_abide_null + pubtheme,
+               p_pima_null + pubtheme ,
+               p_sonar_null + pubtheme,
+               p_musk_null + pubtheme,
+               p_spam_null + pubtheme,
+               
+               common.legend = T, 
+               legend='bottom',
+               labels = 'AUTO',
+               # ncol = 4,
+               # nrow=2,
+               font.label = list(size=8)) 
+p
+
+# ggsave('power_null_individual_null.png', plot = p,
+#        width = 190, height = 150, units = 'mm')
+
+# ggsave('power_null_individual_null.tiff', plot = p,
+#        width = 6, height = 4.7, units = 'in')
+```
+
+```{r}
+library(reshape2)
+
+results_all <- rbind(results_simulated_predictions,
+                     results_svm_sim,
+                     oasis_gm_results_gender,
+                     oasis_gm_results_diagnosis,
+                     oasis_wm_results_gender,
+                     oasis_wm_results_diagnosis,
+                     results_svm_abide,
+                     results_musk,
+                     results_pima,
+                     results_sonar,
+                     results_spam)
+                     
+results_all_melted <- melt(results_all, id.vars = c('Accuracy', 'parameter'))
+```
+
+```{r, fig.width=5.5, fig.height=2.5}
+library(ggplot2)
+library(cowplot)
+colors <- c("#375e97", "#fb6542", '#ffbb00')
+
+p <- ggplot(results_all_melted, aes(x=Accuracy, y=value)) +
+  geom_point(aes(color=variable), alpha=0.75) +
+  # geom_smooth(aes(color=variable, lty=variable), se = F) +
+  geom_line(stat='smooth', method='loess',
+            size=0.5) +
+  geom_abline(slope = 1, intercept = 0, lty='dotted') +
+  theme_minimal_grid() +
+  theme(aspect.ratio = 1) +
+  scale_y_continuous(limits=c(0,1), breaks=seq(0, 1, 0.2)) +
+  scale_x_continuous(limits=c(0,1), breaks=seq(0, 1, 0.2)) +
+  scale_color_manual(values = colors) +
+  # scale_linetype_manual(values = c('dotted', 'dashed', 'longdash')) +
+  # xlim(c(0.2,1)) + ylim(c(0.2,1)) +
+  xlab('Statistical power using accuracy') +
+  ylab('Statistical power using\nalternative performance measures') +
+  facet_wrap(~variable) +
+  pubtheme +
+  theme(strip.text = element_text(size = 8),
+        legend.position = 'none')
+p
+
+# ggsave('power_null_summary.tiff', plot = p,
+#        width = 140, height = 56, units = 'mm')
+```

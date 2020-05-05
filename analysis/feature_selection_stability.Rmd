@@ -1,0 +1,290 @@
+---
+title: "feature_selection_stability"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{feature_selection_stability}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+This document compares the stability of feature selection based on specific performance measures. 
+
+First, we create a custom feature selection method that performs sequential forward search based on an arbitrary performance measure using `mlr` library.
+
+```{r}
+custom.featsel <- function(x, y, q, measure){
+  library(mlr)
+  dataset <- cbind.data.frame(x, y)
+  dataset.task <- makeClassifTask(data=dataset, target = 'y')
+  rdesc <- makeResampleDesc("Holdout")
+  lrn <- makeFeatSelWrapper(makeLearner("classif.plr", predict.type='prob'),
+                           resampling = rdesc, 
+                           measures = measure,
+                           control = makeFeatSelControlSequential(method='sfs', alpha=0), 
+                           show.info = FALSE)  
+  capture.output(
+    mod <- train(lrn, task=dataset.task), 
+    file='NUL')
+  
+  fsel_res <- getFeatSelResult(mod)
+  selection_path <- fsel_res$x
+  all_features <- mod$features
+  features_not_selected <- all_features[!(all_features %in% selection_path)]
+  selection_path_extended <- c(selection_path, sample(features_not_selected))
+  
+  path_matrix <- rep(F, length(selection_path_extended))
+  for (i in 1:length(selection_path_extended)){
+    path_matrix <- rbind(path_matrix,
+                         all_features %in% selection_path_extended[1:i])
+  }
+  colnames(path_matrix) <- all_features
+  path_matrix <- t(path_matrix)
+  colnames(path_matrix) <- sapply(1:ncol(path_matrix), function(x){paste0('s',x-1)})
+  path_matrix
+  selected_features <- all_features %in% selection_path
+  names(selected_features) <- all_features
+  return(list(selected = selected_features, path = path_matrix))
+}
+```
+
+
+```{r}
+plot_stabsels <- function(phat, title, red_id, black_id){
+  to_plot <- phat
+  plot(to_plot[1,], type='l', col='red',
+       ylab="Selection probability", 
+       xlab="N variables selected",
+       main=title)
+  for(i in red_id){
+    lines(to_plot[i,], type='l', col='red')
+  }
+    for(i in black_id){
+    lines(to_plot[i,], type='l', col='black')
+  }
+}
+```
+
+Next, run the stability selection procedure from `stabs` library using our custom feature selection method for specific performance measures
+
+```{r}
+custom.featsel.acc <- function(x, y, q){
+  custom.featsel(x, y, q, mlr::acc)
+}
+custom.featsel.auc <- function(x, y, q){
+  custom.featsel(x, y, q, mlr::auc)
+}
+custom.featsel.brier <- function(x, y, q){
+  custom.featsel(x, y, q, mlr::brier)
+}
+custom.featsel.logloss <- function(x, y, q){
+  custom.featsel(x, y, q, mlr::logloss)
+}
+
+# source('./functions.R')
+downsample_to_balance <- function(y){
+     nr <- length(y)
+     size <- min(table(y))
+     idx <- lapply(split(seq_len(nr), y), function(.x) sample(.x, size))
+     unlist(idx)
+}
+```
+
+
+```{r}
+data("PimaIndiansDiabetes")
+ds <- PimaIndiansDiabetes
+ds$diabetes <- as.factor(as.numeric(ds$diabetes) - 1)
+downsampled_idx <- downsample_to_balance(ds$diabetes)
+ds <- ds[downsampled_idx,]
+
+
+x <- ds[,1:8]
+x_permuted <- x
+x_permuted <- apply(x_permuted, 2, function(x){sample(x)})
+colnames(x_permuted) <- sapply(colnames(x_permuted), function(x){paste0('perm_', x)})
+x <- cbind.data.frame(x, x_permuted)
+y <- ds[,9]
+
+
+library(stabs)
+custom.stabsel.acc.pima <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.acc)
+custom.stabsel.auc.pima <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.auc)
+custom.stabsel.brier.pima <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.brier)
+custom.stabsel.logloss.pima <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.logloss)
+```
+
+
+```{r}
+par(mfrow=c(2,2))
+plot_stabsels(custom.stabsel.acc.pima$phat, 'Accuracy', 1:8, 9:16)
+plot_stabsels(custom.stabsel.auc.pima$phat, 'auc', 1:8, 9:16)
+plot_stabsels(custom.stabsel.brier.pima$phat, 'brier', 1:8, 9:16)
+plot_stabsels(custom.stabsel.logloss.pima$phat, 'Logarithmic', 1:8, 9:16)
+```
+
+
+```{r}
+
+library(kernlab)
+data("spam")
+spam$type <- as.numeric(spam$type) - 1
+names(spam)[58] <- 'y'
+
+spam <- spam[1:2000,]
+spam <- spam[downsample_to_balance(spam$y),]
+
+x <- spam[,1:20]
+x_permuted <- x
+x_permuted <- apply(x_permuted, 2, function(x){sample(x)})
+colnames(x_permuted) <- sapply(colnames(x_permuted), function(x){paste0('perm_', x)})
+x <- cbind.data.frame(x, x_permuted)
+y <- as.factor(spam$y)
+
+
+custom.stabsel.acc.spam <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.acc)
+custom.stabsel.auc.spam <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.auc)
+custom.stabsel.brier.spam <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.brier)
+custom.stabsel.logloss.spam <- stabsel(x,
+                              y,
+                              cutoff=0.75,
+                              PFER=1,
+                              fitfun=custom.featsel.logloss)
+```
+
+
+```{r}
+par(mfrow=c(2,2))
+plot_stabsels(custom.stabsel.acc.spam$phat, 'Accuracy', 1:20, 21:40)
+plot_stabsels(custom.stabsel.auc.spam$phat, 'auc', 1:20, 21:40)
+plot_stabsels(custom.stabsel.brier.spam$phat, 'brier', 1:20, 21:40)
+plot_stabsels(custom.stabsel.logloss.spam$phat, 'Logarithmic', 1:20, 21:40)
+```
+
+plot
+
+```{r}
+library(reshape2)
+library(ggplot2)
+library(cowplot)
+
+format_stabsel_data <- function(stabsel_data, measure){
+  data_to_plot <- as.data.frame(t(stabsel_data$phat))
+  data_to_plot$n_selected <- as.numeric(unlist(lapply(row.names(data_to_plot), function(x) {strsplit(x, 's')[[1]][2]})))
+  data_to_plot <- melt(data_to_plot, id.vars = 'n_selected')
+  data_to_plot$measure = measure
+  return(data_to_plot)
+}
+
+pubtheme <- theme(aspect.ratio = 1,
+                  text=element_text(size=7),
+                  plot.title = element_text(size=8),
+                  axis.text = element_text(size=7), 
+                  strip.text = element_text(size=8, face='bold'),
+                  # legend.position = 'none',
+                  legend.justification = c(0.5, 0.5))
+
+
+data_to_plot_spam_long <- do.call(rbind, 
+                             mapply(format_stabsel_data, 
+                             list(custom.stabsel.acc.spam,
+                                  custom.stabsel.auc.spam,
+                                  custom.stabsel.brier.spam,
+                                  custom.stabsel.logloss.spam),
+                             list('Accuracy', 'AUC', 'Brier', 'Logscore'),
+                             SIMPLIFY = FALSE))
+data_to_plot_spam_long$permuted <- ifelse(
+  startsWith(as.character(data_to_plot_spam_long$variable), 'perm'),
+  'Permuted', 'Not permuted')
+
+
+p_spam <- ggplot(data_to_plot_spam_long, 
+       aes(x=n_selected, y=value, group=variable, color=permuted)) +
+  geom_line() +
+  facet_wrap(~measure, nrow = 1) +
+  scale_color_manual(values = c('red', 'black')) +
+  ylab('Selection probability') +
+  xlab('Number of variables selected') +
+  theme_minimal_grid() +
+  theme(legend.title = element_blank()) +
+  pubtheme 
+```
+
+
+```{r}
+data_to_plot_pima_long <- do.call(rbind, 
+                             mapply(format_stabsel_data, 
+                             list(custom.stabsel.acc.pima,
+                                  custom.stabsel.auc.pima,
+                                  custom.stabsel.brier.pima,
+                                  custom.stabsel.logloss.pima),
+                             list('Accuracy', 'AUC', 'Brier', 'Logscore'),
+                             SIMPLIFY = FALSE))
+data_to_plot_pima_long$permuted <- ifelse(
+  startsWith(as.character(data_to_plot_pima_long$variable), 'perm'),
+  'Permuted', 'Not permuted')
+
+p_pima <- ggplot(data_to_plot_pima_long, 
+       aes(x=n_selected, y=value, group=variable, color=permuted)) +
+  geom_line() +
+  facet_wrap(~measure, nrow = 1) +
+  scale_color_manual(values = c('red', 'black')) +
+  ylab('Selection probability') +
+  xlab('Number of variables selected') +
+  theme_minimal_grid() +
+  theme(legend.title = element_blank()) +
+  pubtheme 
+```
+
+
+```{r}
+library(ggpubr)
+
+p_stabsel <- ggarrange(p_spam,
+          p_pima,
+          nrow = 2, 
+          common.legend = TRUE,
+          legend = 'bottom',
+          # labels = 'AUTO',
+          labels = c('Diabetes data', 'Spam data'),
+          font.label = list(size=8))
+p_stabsel
+
+# ggsave('stabsel.tiff', p_stabsel, width = 6, height = 4, units = 'in')
+```
+
+

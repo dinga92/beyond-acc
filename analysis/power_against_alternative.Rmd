@@ -1,0 +1,757 @@
+---
+title: "power_against_alternative"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{power_against_alternative}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# Introduction
+
+In this document, we compare type I and type II error rates when comparing the performance of competing models using various performance measures. This largely mirrors the analysis in `power_against_chance_level.Rmd` but we are not testing the hypothesis that there is no effect, but that the two models have the same performance (i.e., the difference between their errors is 0)
+
+# Set up helper functions
+
+A convenience function to compute multiple p values, the actual functions that compute p values are in the `../helpers/significance_comparisons_functions.R`
+
+```{r setup}
+source('../helpers/data_loading.R')
+source('../helpers/significance_comparisons_functions.R')
+source('../helpers/utility_functions.R')
+source('../helpers/scoring_functions.R')
+
+compare_all <- function(preds1, preds2, y){
+  c('acc'=compare_accuracy(preds1 < 0.5, preds2 < 0.5, y),
+    'auc'=compare_auc(preds1, preds2, y),
+    'brier'=compare_brier(preds1, preds2, y),
+    'logscore'=compare_logscore(preds1, preds2, y))
+}
+```
+
+We use the same function as in `power_against_chance_level.Rmd`
+
+```{r, cache=TRUE}
+library(parallel)
+calculate_proportion_signifficant <- function(generator,
+                                              parameters,
+                                              n_sims, 
+                                              ncores=1){
+  # intialize cluster for parallel processing, type='FORK' for workers
+  # to be able to use defined functions, i.e. the generator
+  cl = makeCluster(ncores, type = 'FORK')
+  clusterSetRNGStream(cl) # so that random numebrs don't synchronize 
+  on.exit(stopCluster(cl))
+  # for each parameter form the list of parameters, we run generator function
+  # that produce p-values n_sims number of times
+  results <- list()
+  for(parameter in parameters){
+    # this does the same as the line bellow, only in parallel
+    # pvals <- t(replicate(n_sims, generator(param)))
+    pvals <- t(parSapply(cl, 1:n_sims, function(x){generator(parameter)}))
+    # calculate proportions of p values < 0.05
+    results <- append(results, list(colMeans(pvals < 0.05)))
+  }
+  results <- as.data.frame(do.call(rbind, results))
+  results$parameter <- parameters
+  return(results)
+}
+```
+
+and the plotting function
+
+```{r, cache=TRUE}
+library(ggplot2)
+library(cowplot)
+library(reshape2)
+
+plot_results_lines <- function(alphas, id_name='parameter'){
+  lines_colors <- c("black", "#375e97", "#fb6542", 'black')
+  melted_alphas <- melt(alphas, id.vars = id_name)
+  names(melted_alphas)[1] <- 'x'
+  
+  ggplot(melted_alphas, aes(x=x, y=value, color=variable, linetype=variable)) +
+    geom_line()  +
+    geom_point(aes(shape=variable, size=variable)) +
+    scale_color_manual(values=lines_colors) +
+    scale_linetype_manual(values = c('solid', 'solid','solid',  'dashed')) +
+    scale_shape_manual(values=c(19,19,19,1)) +
+    scale_size_manual(values=c(2,2,2,4)) +
+    
+    theme_minimal_grid() +
+    scale_y_continuous(limits=c(0,1), breaks=seq(0, 1, 0.2))+
+    theme(aspect.ratio = 1,
+          # text=element_text(size=7),
+          # axis.text = element_text(size=7),
+          legend.position = 'bottom',
+          legend.justification = c(0.5, 0.5),
+          legend.title=element_blank(),
+          legend.key.width = unit(20, 'mm'))  +
+    ylab('Proportion p < 0.05') +
+    xlab('Relative training set size')
+}
+```
+
+
+### Simulated predictions
+
+Create a function that simulates correlated predictions from two models. We can specify the performance of the first model and how much is the second model better.
+
+```{r, cache=TRUE}
+library(psych)
+
+simulate_comparison <- function(n, signal_sd, random_difference_sd,
+                                improvement_scale){
+  y <- c(rep(0, n), rep(1, n))
+  predictions_latent <- c(rnorm(n, -signal_sd/2), rnorm(n, signal_sd/2))
+  predictions_noise <- rnorm(length(predictions_latent), sd=random_difference_sd)
+  predictions_improvement <- sign(y-0.5)*improvement_scale
+  predictions_A <- logistic(predictions_latent + predictions_noise)
+  predictions_B <- logistic(predictions_latent - predictions_noise + predictions_improvement)
+  compare_all(predictions_A, predictions_B, y)
+}
+```
+
+and we create a generator out of this
+
+```{r, cache=TRUE}
+gen_compr_pval_n <- function(n){
+  simulate_comparison(n = n,
+                      signal_sd = 1,
+                      random_difference_sd = 0.1,
+                      improvement_scale = 0.05)
+}
+
+gen_compr_pval_n_null <- function(n){
+  simulate_comparison(n = n,
+                      signal_sd = 1,
+                      random_difference_sd = 0.1,
+                      improvement_scale = 0) # true improvement == 0
+}
+```
+
+and run the analysis
+
+```{r, cache=TRUE}
+n_sims <- 1000
+
+n_vec <- seq(20,500,100)
+results_comp_n <- calculate_proportion_signifficant(gen_compr_pval_n,
+                                                    parameters = n_vec,
+                                                    n_sims = n_sims,
+                                                    ncores = 4)
+plot_results_lines(results_comp_n)
+```
+
+
+```{r, cache=TRUE}
+results_comp_n_null <- calculate_proportion_signifficant(gen_compr_pval_n_null,
+                                                    parameters = n_vec,
+                                                    n_sims = n_sims*10,
+                                                    ncores = 4)
+plot_results_lines(results_comp_n_null)
+```
+
+### Simulated data - GPR predictions
+
+A function that takes the data generator, number of subjects, and the proportion of smaller training set to fit two models and compare their predictions.
+
+```{r, cache=TRUE}
+compare_gpc_full_vs_reduced <- function(data_generator, n, prop, 
+                                        shuffle.predictions=FALSE){
+  library(caret)
+  library(kernlab)
+  data <- data_generator(n*2)
+  data <- as.data.frame(data)
+  train_idx <- createDataPartition(data$y, list=F)
+  test_data <- data[-train_idx,]
+  train_data <- data[train_idx,]
+  
+  train_idx_small <- createDataPartition(train_data$y, list=F, p=prop)
+  train_data_small <- train_data[train_idx_small,]
+  
+  fit_full <- gausspr(as.factor(y) ~ .,
+                      data=train_data,
+                      kpar=list(sigma=0.01))
+  
+  fit_reduced <- gausspr(as.factor(y) ~ .,
+                      data=train_data_small,
+                      kpar=list(sigma=0.01))
+  
+  predictions_full <- as.data.frame(predict(fit_full,
+                                             newdata=test_data,
+                                             type='probabilities'))$`1`
+  predictions_reduced <- as.data.frame(predict(fit_reduced,
+                                             newdata=test_data,
+                                             type='probabilities'))$`1`
+  if (shuffle.predictions){
+     shuffled_idx <- sample(x = c(FALSE, TRUE), 
+                            replace = T, 
+                            prob = c(0.5, 0.5), 
+                            size = length(predictions_full))
+     predictions_all <- cbind(predictions_full, predictions_reduced)
+     predictions_all[shuffled_idx,] <- t(apply(predictions_all[shuffled_idx,],
+                                             1,
+                                             rev))
+     predictions_full <- predictions_all[,1]
+     predictions_reduced <- predictions_all[,2]
+  }
+  compare_all(predictions_full, predictions_reduced, test_data$y)
+}
+```
+
+simulated data data generator
+
+```{r, cache=TRUE}
+mixed_gaussians_data_generator <- function(n){
+  library(MASS)
+  n_signal <- 50
+  n_noise <- 50
+  signal_strenght <- 0.4
+
+  sigma <- diag(n_signal + n_noise)
+  x1 <- mvrnorm(n=n, mu=c(rep(0,n_noise),rep(0, n_signal)), Sigma=sigma)
+  x2 <- mvrnorm(n=n, mu=c(rep(0,n_noise),rep(1, n_signal)*signal_strenght), sigma)
+  x <- rbind(x1, x2)
+  y <- c(rep(0, nrow(x1)), rep(1, nrow(x2)))
+  df <- as.data.frame(cbind(y, x))
+}
+```
+
+Putting it all together to run simulations
+
+```{r, cache=TRUE}
+gpc_comparison_mixedgaussian_generator <- function(prop){
+  compare_gpc_full_vs_reduced(mixed_gaussians_data_generator,
+                              n = 100,
+                              prop = prop)
+}
+
+gpc_comparison_mixedgaussian_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(mixed_gaussians_data_generator,
+                              n = 100,
+                              prop = prop,
+                              shuffle.predictions = TRUE)
+}
+
+n_vec <- c(0.1, 0.25, 0.5, 0.75, 1)
+n_vec <- seq(0.1, 0.9, by=0.2)
+
+results_gpc_simulated <- calculate_proportion_signifficant(
+                                 gpc_comparison_mixedgaussian_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+plot_results_lines(results_gpc_simulated)
+```
+
+```{r, cache=TRUE}
+results_gpc_simulated_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_mixedgaussian_generator_null,
+                                 parameters = seq(0.1, 1, length.out = 6),
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+plot_results_lines(results_gpc_simulated_null)
+```
+
+
+### Real data - OASIS
+
+Now we create the data generator. This generator takes the number of subjects *n* as an input and returns a random sample of size *n* with the same number of subjects for each target group (male or female). We also prepare a generator function to create the null data i.e., data with shuffled target values. 
+
+```{r, cache=TRUE}
+oasis_data_gender_gm <- load_oasis(y = 'gender', modality = 'gm')
+oasis_data_gender_wm <- load_oasis(y = 'gender', modality = 'wm')
+oasis_data_diag_gm <- load_oasis(y = 'diagnosis', modality = 'gm')
+oasis_data_diag_wm <- load_oasis(y = 'diagnosis', modality = 'wm')
+
+
+oasis_balanced_data_generator <- function(oasis_data, n, shuffle.y=FALSE){
+  idx0 <- which(oasis_data$y %in% 0, arr.ind = T)
+  idx1 <- which(oasis_data$y %in% 1, arr.ind = T)
+  selected <- c(sample(idx0, n/2), sample(idx1, n/2))
+  return_data <- oasis_data[selected,]
+  if (shuffle.y){
+    return_data$y <- sample(return_data$y)
+  }
+  return(return_data)
+}
+
+
+oasis_gender_gm_generator <- function(n, shuffle.y = FALSE){
+  oasis_balanced_data_generator(oasis_data_gender_gm, n, shuffle.y = shuffle.y)
+}
+oasis_gender_wm_generator <- function(n, shuffle.y = FALSE){
+  oasis_balanced_data_generator(oasis_data_gender_wm, n, shuffle.y = shuffle.y)
+}
+oasis_diag_gm_generator <- function(n, shuffle.y = FALSE){
+  oasis_balanced_data_generator(oasis_data_diag_gm, n, shuffle.y = shuffle.y)
+}
+oasis_diag_wm_generator <- function(n, shuffle.y = FALSE){
+  oasis_balanced_data_generator(oasis_data_diag_wm, n, shuffle.y = shuffle.y)
+}
+
+
+gpc_comparison_oasis_gender_gm_generator <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_gender_gm_generator,
+                              n = 100,
+                              prop = prop)
+}
+gpc_comparison_oasis_gender_wm_generator <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_gender_wm_generator,
+                              n = 100,
+                              prop = prop)
+}
+gpc_comparison_oasis_diag_gm_generator <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_diag_gm_generator,
+                              n = 50,
+                              prop = prop)
+}
+gpc_comparison_oasis_diag_wm_generator <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_diag_wm_generator,
+                              n = 50,
+                              prop = prop)
+}
+
+
+gpc_comparison_oasis_gender_gm_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_gender_gm_generator,
+                              n = 100,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+gpc_comparison_oasis_gender_wm_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_gender_wm_generator,
+                              n = 100,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+gpc_comparison_oasis_diag_gm_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_diag_gm_generator,
+                              n = 50,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+gpc_comparison_oasis_diag_wm_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(oasis_diag_wm_generator,
+                              n = 50,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+
+
+results_gpc_oasis_gender_gm <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_gender_gm_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_oasis_gender_wm <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_gender_wm_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_oasis_diag_gm <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_diag_gm_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_oasis_diag_wm <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_diag_wm_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+
+
+results_gpc_oasis_gender_gm_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_gender_gm_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+results_gpc_oasis_gender_wm_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_gender_wm_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+results_gpc_oasis_diag_gm_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_diag_gm_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+results_gpc_oasis_diag_wm_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_oasis_diag_wm_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+
+
+plot_results_lines(results_gpc_oasis_gender_gm)
+plot_results_lines(results_gpc_oasis_gender_wm)
+plot_results_lines(results_gpc_oasis_diag_gm)
+plot_results_lines(results_gpc_oasis_diag_wm)
+
+plot_results_lines(results_gpc_oasis_gender_gm_null)
+plot_results_lines(results_gpc_oasis_gender_wm_null)
+plot_results_lines(results_gpc_oasis_diag_gm_null)
+plot_results_lines(results_gpc_oasis_diag_wm_null)
+
+```
+
+### Real data - abide
+
+```{r, cache=TRUE}
+abide_data <- load_abide()
+
+abide_balanced_data_generator <- function(n, shuffle.y=FALSE){
+  idx0 <- which(abide_data$y %in% 0, arr.ind = T)
+  idx1 <- which(abide_data$y %in% 1, arr.ind = T)
+  selected <- c(sample(idx0, n/2), sample(idx1, n/2))
+  selected_data <- abide_data[selected,]
+  selected_data <- selected_data[,apply(selected_data, 2, sd) != 0]
+  if (shuffle.y){
+    selected_data$y <- sample(selected_data$y)
+  }
+  return(selected_data)
+}
+
+abide_balanced_data_generator_null <- function(n){
+  abide_balanced_data_generator(n, shuffle.y = TRUE)
+}
+
+gpc_comparison_abide_generator <- function(prop){
+  compare_gpc_full_vs_reduced(abide_balanced_data_generator,
+                              n = 100,
+                              prop = prop)
+}
+
+gpc_comparison_abide_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(abide_balanced_data_generator,
+                              n = 100,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+
+
+results_gpc_abide <- calculate_proportion_signifficant(
+                                 gpc_comparison_abide_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_abide_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_abide_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+
+
+plot_results_lines(results_gpc_abide)
+plot_results_lines(results_gpc_abide_null)
+
+
+```
+
+## non imaging datasets
+
+```{r, cache=TRUE}
+library(mlbench)
+data("PimaIndiansDiabetes")
+names(PimaIndiansDiabetes)[9] <- 'y'
+PimaIndiansDiabetes$y <- as.numeric(PimaIndiansDiabetes$y) - 1
+
+
+pima_balanced_data_generator <- function(n, shuffle.y=FALSE){
+  idx0 <- which(PimaIndiansDiabetes$y %in% 0, arr.ind = T)
+  idx1 <- which(PimaIndiansDiabetes$y %in% 1, arr.ind = T)
+  selected <- c(sample(idx0, n/2), sample(idx1, n/2))
+  selected_data <- PimaIndiansDiabetes[selected,]
+  selected_data <- selected_data[,apply(selected_data, 2, sd) != 0]
+  if (shuffle.y){
+    selected_data$y <- sample(selected_data$y)
+  }
+  return(selected_data)
+}
+
+pima_balanced_data_generator_null <- function(n){
+  pima_balanced_data_generator(n, shuffle.y = TRUE)
+}
+
+gpc_comparison_pima_generator <- function(prop){
+  compare_gpc_full_vs_reduced(pima_balanced_data_generator,
+                              n = 100,
+                              prop = prop)
+}
+
+gpc_comparison_pima_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(pima_balanced_data_generator,
+                              n = 100,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+
+
+results_gpc_pima <- calculate_proportion_signifficant(
+                                 gpc_comparison_pima_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_pima_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_pima_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+
+
+plot_results_lines(results_gpc_pima)
+plot_results_lines(results_gpc_pima_null)
+```
+
+```{r, cache=TRUE}
+data("Sonar")
+Sonar$Class <- as.numeric(Sonar$Class) -1
+names(Sonar)[61] <- 'y'
+
+
+sonar_balanced_data_generator <- function(n, shuffle.y=FALSE){
+  idx0 <- which(Sonar$y %in% 0, arr.ind = T)
+  idx1 <- which(Sonar$y %in% 1, arr.ind = T)
+  selected <- c(sample(idx0, n/2), sample(idx1, n/2))
+  selected_data <- Sonar[selected,]
+  selected_data <- selected_data[,apply(selected_data, 2, sd) != 0]
+  if (shuffle.y){
+    selected_data$y <- sample(selected_data$y)
+  }
+  return(selected_data)
+}
+
+sonar_balanced_data_generator_null <- function(n){
+  sonar_balanced_data_generator(n, shuffle.y = TRUE)
+}
+
+gpc_comparison_sonar_generator <- function(prop){
+  compare_gpc_full_vs_reduced(sonar_balanced_data_generator,
+                              n = 50,
+                              prop = prop)
+}
+
+gpc_comparison_sonar_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(sonar_balanced_data_generator,
+                              n = 50,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+
+
+results_gpc_sonar <- calculate_proportion_signifficant(
+                                 gpc_comparison_sonar_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_sonar_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_sonar_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+
+
+plot_results_lines(results_gpc_sonar)
+plot_results_lines(results_gpc_sonar_null)
+```
+
+
+```{r, cache=TRUE}
+library(kernlab)
+data("musk")
+musk$Class <- as.numeric(musk$Class) - 1
+names(musk)[167] <- 'y'
+
+
+musk_balanced_data_generator <- function(n, shuffle.y=FALSE){
+  idx0 <- which(musk$y %in% 0, arr.ind = T)
+  idx1 <- which(musk$y %in% 1, arr.ind = T)
+  selected <- c(sample(idx0, n/2), sample(idx1, n/2))
+  selected_data <- musk[selected,]
+  selected_data <- selected_data[,apply(selected_data, 2, sd) != 0]
+  if (shuffle.y){
+    selected_data$y <- sample(selected_data$y)
+  }
+  return(selected_data)
+}
+
+musk_balanced_data_generator_null <- function(n){
+  musk_balanced_data_generator(n, shuffle.y = TRUE)
+}
+
+gpc_comparison_musk_generator <- function(prop){
+  compare_gpc_full_vs_reduced(musk_balanced_data_generator,
+                              n = 100,
+                              prop = prop)
+}
+
+gpc_comparison_musk_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(musk_balanced_data_generator,
+                              n = 100,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+
+
+results_gpc_musk <- calculate_proportion_signifficant(
+                                 gpc_comparison_musk_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_musk_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_musk_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+
+
+plot_results_lines(results_gpc_musk)
+plot_results_lines(results_gpc_musk_null)
+```
+
+```{r, cache=TRUE}
+data("spam")
+spam$type <- as.numeric(spam$type) - 1
+names(spam)[58] <- 'y'
+
+
+spam_balanced_data_generator <- function(n, shuffle.y=FALSE){
+  idx0 <- which(spam$y %in% 0, arr.ind = T)
+  idx1 <- which(spam$y %in% 1, arr.ind = T)
+  selected <- c(sample(idx0, n/2), sample(idx1, n/2))
+  selected_data <- spam[selected,]
+  selected_data <- selected_data[,apply(selected_data, 2, sd) != 0]
+  if (shuffle.y){
+    selected_data$y <- sample(selected_data$y)
+  }
+  return(selected_data)
+}
+
+spam_balanced_data_generator_null <- function(n){
+  spam_balanced_data_generator(n, shuffle.y = TRUE)
+}
+
+gpc_comparison_spam_generator <- function(prop){
+  compare_gpc_full_vs_reduced(spam_balanced_data_generator,
+                              n = 100,
+                              prop = prop)
+}
+
+gpc_comparison_spam_generator_null <- function(prop){
+  compare_gpc_full_vs_reduced(spam_balanced_data_generator,
+                              n = 100,
+                              prop = prop,
+                              shuffle.predictions = T)
+}
+
+
+results_gpc_spam <- calculate_proportion_signifficant(
+                                 gpc_comparison_spam_generator,
+                                 parameters = n_vec,
+                                 n_sims = n_sims,
+                                 ncores = 4)
+results_gpc_spam_null <- calculate_proportion_signifficant(
+                                 gpc_comparison_spam_generator_null,
+                                 parameters = n_vec,
+                                 n_sims = n_sims*10,
+                                 ncores = 4)
+
+
+plot_results_lines(results_gpc_spam)
+plot_results_lines(results_gpc_spam_null)
+```
+
+## plotting
+
+```{r, fig.width=7.4, fig.height=6}
+plot_results_lines <- function(alphas, id_name='parameter'){
+  lines_colors <- c("black", "#375e97", "#fb6542", 'black')
+  melted_alphas <- melt(alphas, id.vars = id_name)
+  names(melted_alphas)[1] <- 'x'
+  
+  ggplot(melted_alphas, aes(x=x, y=value, color=variable, linetype=variable)) +
+    geom_line()  +
+    geom_point(aes(shape=variable, size=variable)) +
+    scale_color_manual(values=lines_colors) +
+    scale_linetype_manual(values = c('solid', 'solid','solid',  'dashed')) +
+    scale_shape_manual(values=c(19,19,19,1)) +
+    scale_size_manual(values=c(2,2,2,4)) +
+    
+    theme_minimal_grid() +
+    scale_y_continuous(limits=c(0,1), breaks=seq(0, 1, 0.2))+
+    scale_x_continuous(limits=c(0,1), breaks=seq(0.1, 0.9, 0.2))+
+    theme(aspect.ratio = 1,
+          # text=element_text(size=7),
+          # axis.text = element_text(size=7),
+          legend.position = 'bottom',
+          legend.justification = c(0.5, 0.5),
+          legend.title=element_blank(),
+          legend.key.width = unit(10, 'mm')) +
+    ylab('Proportion p < 0.05') +
+    xlab('Relative training set size')
+}
+
+
+pubtheme <- theme(aspect.ratio = 1,
+                  text=element_text(size=7),
+                  axis.text = element_text(size=7), 
+                  legend.position = 'bottom',
+                  legend.justification = c(0.5, 0.5))
+
+library(ggpubr)
+
+
+p1 <- plot_results_lines(results_comp_n) + 
+  pubtheme + scale_x_continuous(limits = range(results_comp_n$parameter),
+                                breaks = results_comp_n$parameter) +
+  xlab('n')
+p2 <- plot_results_lines(results_gpc_simulated) + pubtheme
+p3 <- plot_results_lines(results_gpc_oasis_gender_gm) + pubtheme
+p4 <- plot_results_lines(results_gpc_oasis_gender_wm) + pubtheme
+p5 <- plot_results_lines(results_gpc_oasis_diag_gm) + pubtheme
+p6 <- plot_results_lines(results_gpc_oasis_diag_wm) + pubtheme
+p7 <- plot_results_lines(results_gpc_abide) + pubtheme
+p8 <- plot_results_lines(results_gpc_pima) + pubtheme
+p9 <- plot_results_lines(results_gpc_musk) + pubtheme
+p10 <- plot_results_lines(results_gpc_sonar) + pubtheme
+p11 <- plot_results_lines(results_gpc_spam) + pubtheme
+
+p_all <- ggarrange(plotlist = list(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11),
+          common.legend = T, 
+          labels = 'AUTO',
+          font.label = list(size=8),
+          legend='bottom')
+p_all
+
+# ggsave('power_comparison.tiff', p_all, width = 190, height = 150, units = 'mm', dpi=300)
+# ggsave('power_comparison.tiff', p_all, width = 6, height = 4.7, units = 'in')
+```
+
+
+```{r, fig.width=7.5, fig.height=6}
+p1 <- plot_results_lines(results_comp_n_null) + 
+  pubtheme + scale_x_continuous(limits = range(results_comp_n$parameter),
+                                breaks = results_comp_n$parameter) + ylim(c(0,0.1))
+p2 <- plot_results_lines(results_gpc_simulated_null) + pubtheme + ylim(c(0,0.1))
+p3 <- plot_results_lines(results_gpc_oasis_gender_gm_null) + pubtheme + ylim(c(0,0.1))
+p4 <- plot_results_lines(results_gpc_oasis_gender_wm_null) + pubtheme + ylim(c(0,0.1))
+p5 <- plot_results_lines(results_gpc_oasis_diag_gm_null) + pubtheme + ylim(c(0,0.1))
+p6 <- plot_results_lines(results_gpc_oasis_diag_wm_null) + pubtheme + ylim(c(0,0.1))
+p7 <- plot_results_lines(results_gpc_abide_null) + pubtheme + ylim(c(0,0.1))
+p8 <- plot_results_lines(results_gpc_pima_null) + pubtheme + ylim(c(0,0.1))
+p9 <- plot_results_lines(results_gpc_musk_null) + pubtheme + ylim(c(0,0.1))
+p10 <- plot_results_lines(results_gpc_sonar_null) + pubtheme + ylim(c(0,0.1))
+p11 <- plot_results_lines(results_gpc_spam_null) + pubtheme + ylim(c(0,0.1))
+
+ggarrange(plotlist = list(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11),
+          common.legend = T,
+          legend='bottom')
+```

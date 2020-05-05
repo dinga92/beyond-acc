@@ -1,0 +1,480 @@
+---
+title: "cv_reliability"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{cv_reliability}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+In this document, we compare the reliability of cross-validation results using various performance measures.
+
+# Set up
+
+First, create some helper functions
+
+```{r setup}
+library(caret)
+library(kernlab)
+source('../helpers/scoring_functions.R')
+
+downsample_to_balance <- function(y){
+     nr <- length(y)
+     size <- min(table(y))
+     idx <- lapply(split(seq_len(nr), y), function(.x) sample(.x, size))
+     unlist(idx)
+}
+
+get_results <- function(predictions, labels){
+  c('Accuracy'=get_acc_score(predictions > 0.5, labels),
+    'AUC'=get_auc_score(predictions, labels),
+    'Brier'=-get_brier_score(predictions, labels),
+    'Logscore'=-get_log_score(predictions, labels))
+}
+```
+
+A function that runs cross-validation
+
+```{r}
+run_gpc_cv <- function(data, n_folds){
+  folds <- createFolds(data$y, n_folds, list=F)
+  results_cv <- list()
+  
+  for (fold in 1:n_folds){
+    train_data_cv <- data[folds != fold,]
+    test_data_cv <- data[folds == fold,]
+    
+    capture.output( #gausspr function is too verbose so we silence it
+      gpc_fit <- gausspr(as.factor(y) ~ .,
+                          data=train_data_cv)
+    )
+    predictions <- as.data.frame(predict(gpc_fit,
+                                 newdata=test_data_cv,
+                                 type='probabilities'))$`1`
+    results_cv[[fold]] <- get_results(predictions, test_data_cv$y)
+  }
+  cv_average_results <- colMeans(do.call(rbind, results_cv))
+}
+```
+
+a function that runs and compares cross-validation and hold-out results
+
+```{r}
+compare_cv <- function(data, validation_split, p_cv){
+  data_cv <- data[split,]
+  data_cv <- data_cv[createDataPartition(data_cv$y, p = p_cv, list = F),]
+  data_validation <- data[-split,]
+  
+  results_cv <- run_gpc_cv(data_cv, 10)
+  
+  capture.output( #gausspr function is too verbose so we silence it
+      gpc_fit <- gausspr(as.factor(y) ~ .,
+                          data=data_cv)
+    )
+  predictions <- as.data.frame(predict(gpc_fit,
+                               newdata=data_validation,
+                               type='probabilities'))$`1`
+  results_validation <- get_results(predictions, data_validation$y)
+
+  c(results_cv, results_validation)
+}
+```
+
+a function that creates a dataset with partially shuffled y, to create simulate datasets with lower ground truth performance
+
+```{r}
+create_partially_shuffled_data <- function(data, prop_shufle){
+  shuffled_idx <- createDataPartition(data$y, p=prop_shufle, list = F)
+  data$y[shuffled_idx] <- ifelse(data$y[shuffled_idx] == 0, 1, 0)
+  return(data)
+}
+
+
+compare_cv_partially_shuffled <- function(data, split, p_cv){
+  # n_shuffled_vars <- sample(2:(ncol(data)-1), 1)
+  # n_shuffled_vars <- 5
+  prop_shufle <- sample(size = 1, x = seq(0, 0.2, length.out = 20))
+  data[split,] <- create_partially_shuffled_data(data[split,], prop_shufle)
+  data[-split,] <- create_partially_shuffled_data(data[-split,], prop_shufle)
+  compare_cv(data, split, p_cv)
+}
+
+
+library(parallel)
+compare_cv_partially_shuffled_multicore <- function(data, n_sims,  
+                                                    split, p_cv, ncores=1){
+  cl = makeCluster(ncores, type = 'FORK')
+  clusterSetRNGStream(cl)
+  on.exit(stopCluster(cl))
+  results <- as.data.frame(t(parSapply(cl, 1:n_sims,
+                  function(x){compare_cv_partially_shuffled(data, split, p_cv)})))
+  names(results) <- make.unique(names(results))
+  return(results)
+}
+
+```
+
+a function that runs the analysis with for multiple data sizes
+
+```{r}
+compare_cv_4n <- function(data, split, n_sims){
+  results_50 <- compare_cv_partially_shuffled_multicore(data, 
+                                                         n_sims, 
+                                                         4,
+                                                         split = split,
+                                                         p_cv=50/length(split))
+  results_100 <- compare_cv_partially_shuffled_multicore(data, 
+                                                         n_sims, 
+                                                         4,
+                                                         split = split,
+                                                         p_cv=100/length(split))
+  results_150 <- compare_cv_partially_shuffled_multicore(data, 
+                                                         n_sims, 
+                                                         4,
+                                                         split = split,
+                                                         p_cv=150/length(split))
+  results_200 <- compare_cv_partially_shuffled_multicore(data, 
+                                                         n_sims, 
+                                                         4,
+                                                         split = split,
+                                                         p_cv=200/length(split))
+  results_250 <- compare_cv_partially_shuffled_multicore(data, 
+                                                         n_sims, 
+                                                         4,
+                                                         split = split,
+                                                         p_cv=250/length(split))
+  return(list(results_50, results_100, results_150, results_200, results_250))
+}
+```
+
+run the analysis. The dataset fetching functions are in `../helpers/data_loading.R`
+
+```{r}
+data.magic <- fetch_magic_data()
+data.magic <- data.magic[downsample_to_balance(data.magic$y),]
+split <- createDataPartition(data.magic$y, p=1-1000/nrow(data.magic), list = F)
+results_magic <- compare_cv_4n(data.magic, split, 512)
+```
+
+
+```{r}
+data.mushrooms <- fetch_mushrooms()
+data.mushrooms <- data.mushrooms[downsample_to_balance(data.mushrooms$y),]
+split <- createDataPartition(data.mushrooms$y, 
+                             p=1-1000/nrow(data.mushrooms), 
+                             list = F)
+results_mushrooms <- compare_cv_4n(data.mushrooms, split, 512)
+```
+
+
+```{r}
+data.shopping <- fetch_shopping_data()
+data.shopping <- data.shopping[downsample_to_balance(data.shopping$y),]
+split <- createDataPartition(data.shopping$y, 
+                             p=1-1000/nrow(data.shopping), 
+                             list = F)
+results_shopping <- compare_cv_4n(data.shopping, split, 512)
+```
+
+
+```{r}
+data(spam)
+data.spam <- spam
+names(data.spam)[58] <- 'y'
+data.spam$y <- as.numeric(data.spam$y) - 1
+data.spam <- data.spam[downsample_to_balance(data.spam$y),]
+
+split <- createDataPartition(data.spam$y,
+                             p=1-1000/nrow(data.spam),
+                             list=F)
+
+results_spam <- compare_cv_4n(data.spam,
+                              split,
+                              512)
+```
+
+load datasets that are part of caret and mlbench and run the analysis
+
+```{r}
+library(caret)
+
+data("segmentationData")
+segmentationData <- segmentationData[downsample_to_balance(segmentationData$Class),]
+segmentationData <- segmentationData[, -2]
+names(segmentationData)[2] <- 'y'
+segmentationData$y <- as.numeric(segmentationData$y) - 1
+
+split <- createDataPartition(segmentationData$y,
+                             p=1-1000/nrow(segmentationData),
+                             list=F)
+
+results_segmentation <- compare_cv_4n(segmentationData,
+                                      split,
+                                      128)
+```
+
+```{r}
+library(mlbench)
+data("LetterRecognition")
+LetterRecognition <- LetterRecognition[LetterRecognition$lettr %in% c('C', 'G'),]
+names(LetterRecognition)[1] <- 'y'
+LetterRecognition$y <- ifelse(LetterRecognition$y == 'C', 0, 1)
+LetterRecognition <- LetterRecognition[downsample_to_balance(LetterRecognition$y),]
+
+split <- createDataPartition(LetterRecognition$y,
+                             p=1-1000/nrow(LetterRecognition),
+                             list=F)
+
+results_letter <- compare_cv_4n(LetterRecognition,
+                                split,
+                                128)
+
+```
+
+process results and plot
+
+```{r}
+cor_results <- function(results_comparisons){
+  c(
+    cor(results_comparisons$Accuracy, results_comparisons$Accuracy.1, method='spearman'),
+    cor(results_comparisons$AUC, results_comparisons$AUC.1, method='spearman'),
+    cor(results_comparisons$Brier, results_comparisons$Brier.1, method='spearman'),
+    cor(results_comparisons$Logscore, results_comparisons$Logscore.1, method='spearman'),
+    cor(results_comparisons$Accuracy, results_comparisons$Accuracy.1, method='pearson'),
+    cor(results_comparisons$AUC, results_comparisons$AUC.1, method='pearson'),
+    cor(results_comparisons$Brier, results_comparisons$Brier.1, method='pearson'),
+    cor(results_comparisons$Logscore, results_comparisons$Logscore.1, method='pearson'))
+}
+```
+
+
+```{r}
+results_50 <- as.data.frame(rbind(results_shopping[[1]], results_spam[[1]], 
+                            results_mushrooms[[1]], results_magic[[1]],
+                            results_segmentation[[1]], results_letter[[1]]))
+results_100 <- as.data.frame(rbind(results_shopping[[2]], results_spam[[2]], 
+                             results_mushrooms[[2]], results_magic[[2]],
+                            results_segmentation[[2]], results_letter[[2]]))
+results_150 <- as.data.frame(rbind(results_shopping[[3]], results_spam[[3]], 
+                             results_mushrooms[[3]], results_magic[[3]],
+                            results_segmentation[[3]], results_letter[[3]]))
+results_200 <- as.data.frame(rbind(results_shopping[[4]], results_spam[[4]], 
+                             results_mushrooms[[4]], results_magic[[4]],
+                            results_segmentation[[4]], results_letter[[4]]))
+results_250 <- as.data.frame(rbind(results_shopping[[5]], results_spam[[5]], 
+                             results_mushrooms[[5]], results_magic[[5]],
+                            results_segmentation[[5]], results_letter[[5]]))
+
+n_sims <- nrow(results_50)/6
+dataset_var <- as.factor(unlist(lapply(1:6, function(i){rep(i, n_sims)})))
+results_50$dataset <- dataset_var
+results_100$dataset <- dataset_var
+results_150$dataset <- dataset_var
+results_200$dataset <- dataset_var
+results_250$dataset <- dataset_var
+```
+
+
+```{r, fig.width=7.5, fig.height=2}
+
+library(ggplot2)
+library(cowplot)
+library(colorblindr)
+library(ggpubr)
+library(scales)
+
+pubtheme <- theme(aspect.ratio = 1,
+                  text=element_text(size=7),
+                  plot.title = element_text(size=8),
+                  axis.text = element_text(size=7), 
+                  legend.position = 'none',
+                  legend.justification = c(0.5, 0.5))
+
+plot_results <- function(data, x, y, xlab, ylab){
+  ggplot(data, aes_string(x=x, y=y)) +
+    geom_point(alpha=0.25, color='#009E73') +
+    # geom_point(alpha=0.25, aes(color=dataset)) +
+    # geom_hex() +
+    theme_minimal_grid() +
+    # theme_cowplot() +
+    xlab(xlab) +
+    ylab(ylab) +
+    pubtheme 
+    # coord_equal()
+}
+
+
+data <- results_50
+
+# breaks_acc <- pretty(c(data$Accuracy, data$Accuracy.1), 6)
+breaks_acc <- seq(0.25, to=1, by=0.25)
+# breaks_auc <- pretty(c(data$AUC, data$AUC.1), 5)
+breaks_auc <- seq(0.25, to=1, by=0.25)
+# breaks_brier <- pretty(c(data$Brier, data$Brier.1), 4)
+breaks_brier <- c(-0.25, -0.15)
+# breaks_logscore <- pretty(c(data$Logscore, data$Logscore.1), 5)
+
+xlab <- 'Cross-validation performance'
+ylab <- 'Test-set performance'
+
+library(grid)
+
+p1 <- plot_results(data, 'Accuracy', 'Accuracy.1', xlab, ylab) + 
+  xlim(range(c(data$Accuracy, data$Accuracy.1))) +
+  ylim(range(c(data$Accuracy, data$Accuracy.1))) + 
+  annotation_custom(grobTree(
+    textGrob(bquote(r[s] == .(round(cor(data$Accuracy, data$Accuracy.1, method='spearman'), 2))),
+      x=0.1,
+      y=0.9,
+      hjust=0,
+      gp=gpar(fontsize=8))))
+
+
+p2 <- plot_results(data, 'AUC', 'AUC.1', xlab, '') + 
+  xlim(range(c(data$AUC, data$AUC.1))) +
+  ylim(range(c(data$AUC, data$AUC.1))) + 
+  annotation_custom(grobTree(
+    textGrob(bquote(r[s] == .(round(cor(data$AUC, data$AUC.1, method='spearman'), 2))),
+      x=0.1,
+      y=0.9,
+      hjust=0,
+      gp=gpar(fontsize=8))))
+
+p3 <- plot_results(data, 'Brier', 'Brier.1', xlab, '') + 
+  xlim(range(c(data$Brier, data$Brier.1))) +
+  ylim(range(c(data$Brier, data$Brier.1))) + 
+  annotation_custom(grobTree(
+    textGrob(bquote(r[s] == .(round(cor(data$Brier, data$Brier.1, method='spearman'), 2))),
+      x=0.1,
+      y=0.9,
+      hjust=0,
+      gp=gpar(fontsize=8))))
+
+p4 <- plot_results(data, 'Logscore', 'Logscore.1', xlab, '') + 
+  xlim(range(c(data$Logscore, data$Logscore.1))) +
+  ylim(range(c(data$Logscore, data$Logscore.1))) + 
+  annotation_custom(grobTree(
+    textGrob(bquote(r[s] == .(round(cor(data$Logscore, data$Logscore.1, method='spearman'), 2))),
+      x=0.1,
+      y=0.9,
+      hjust=0,
+      gp=gpar(fontsize=8))))
+
+p_scatters <- ggarrange(p1 + ggtitle('Accuracy'),
+          p2 + ggtitle('AUC'),
+          p3 + ggtitle('Brier'),
+          p4 + ggtitle('Logarithmic'),
+          ncol = 4, nrow = 1,
+          # labels = c('Accuracy',
+          #            'AUC',
+          #            'Brier',
+          #            'Logarithmic'),
+          # font.label = list(size=10),
+          vjust=1)
+          
+p_scatters  
+```
+
+
+```{r}
+cor_results_4n <- function(results, dataset){
+  x <-  as.data.frame(rbind(cor_results(results[[1]]),
+    cor_results(results[[2]]),
+    cor_results(results[[3]]),
+    cor_results(results[[4]]),
+    cor_results(results[[5]])))
+  x$n <- c(50, 100, 150, 200, 250)
+  x$dataset <- dataset
+  return(x)
+}
+
+
+cor_results_all <- as.data.frame(rbind(
+              cor_results_4n(results_shopping, 'shopping'),
+              cor_results_4n(results_mushrooms, 'mushrooms'),
+              cor_results_4n(results_spam, 'spam'),
+              cor_results_4n(results_magic, 'magic'),
+              cor_results_4n(results_segmentation, 'segmentation'),
+              cor_results_4n(results_letter, 'letter')))
+cor_results_all <- cor_results_all[, -c(5:8)]
+
+library(reshape2)
+library(ggplot2)
+cor_results_all_melted <- melt(cor_results_all, id.vars = c('n', 'dataset'))
+
+colors <- c("black", "#375e97", "#fb6542", '#ffbb00')
+ggplot(cor_results_all_melted, aes(x=n, y=value)) +
+  # geom_line(aes(color=variable)) +
+  geom_bar(aes(fill=variable), stat='identity', position='dodge') +
+  ylim(c(0,1)) +
+  facet_wrap(~dataset, nrow = 1) +
+  ylab('Spearman r') + 
+  scale_fill_manual(values = colors) +
+  theme_minimal_hgrid()
+```
+
+
+```{r}
+library('robumeta')
+
+res <- cor_results_all_melted
+
+res$group_mean <- 99999
+res[res$n == 50,]$group_mean <- group.mean(res[res$n == 50,]$value, 
+                                           res[res$n == 50,]$dataset)
+res[res$n == 100,]$group_mean <- group.mean(res[res$n == 100,]$value, 
+                                           res[res$n == 100,]$dataset)
+res[res$n == 150,]$group_mean <- group.mean(res[res$n == 150,]$value, 
+                                           res[res$n == 150,]$dataset)
+res[res$n == 200,]$group_mean <- group.mean(res[res$n == 200,]$value, 
+                                           res[res$n == 200,]$dataset)
+res[res$n == 250,]$group_mean <- group.mean(res[res$n == 250,]$value, 
+                                           res[res$n == 250,]$dataset)
+
+res$centered <- res$value - res$group_mean
+res$n_str <- factor(paste0('n = ', res$n), levels=c("n = 50", 
+                                                       "n = 100",
+                                                       "n = 150",
+                                                       "n = 200",
+                                                       "n = 250"))
+res$variable <- factor(res$variable, labels=c('Accuracy', 'AUC', 'Brier', 'Logarithmic'))
+
+colors <- c("black", "#375e97", "#fb6542", '#ffbb00')
+p_cors <- ggplot(res) +
+  geom_bar(aes(x=dataset, y=centered, fill=variable),
+           stat='identity', position = 'dodge') +
+  facet_wrap(~n_str, scales = 'free_y', nrow = 1) +
+  scale_fill_manual(values = colors) +
+  ylab("Difference from mean\nSpearman correlation") +
+  theme_minimal_grid() +
+  pubtheme +
+  theme(axis.text.x = element_text(angle=90, hjust=1),
+        strip.text = element_text(size=8, face='bold')) +
+  theme(legend.position = 'bottom') +
+  labs(fill='') +
+  xlab('') +
+  theme(legend.key.size = unit(2, 'mm'))
+
+p_cors
+```
+
+
+```{r, fig.width=6, fig.height=4.3}
+p <- ggarrange(p_scatters,
+          p_cors, 
+          nrow = 2,
+          heights = c(1,1),
+          labels = 'AUTO',
+          font.label = list(size=8))
+
+p
+# ggsave('cor_reliability.tiff', p, width = 190, height = 127, units = 'mm', dpi=300)
+# ggsave('cor_reliability.tiff', p, width = 6, height = 4.3, units = 'in')
+```
